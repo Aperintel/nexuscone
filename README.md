@@ -2,7 +2,7 @@
 
 Tamper-evident append-only audit ledger with a SHA-256 hash chain and optional Ed25519 signing, designed for AI systems, agent platforms, and regulated software where every action needs to be provably unmodified after the fact.
 
-[![CI](https://github.com/osiabu/nexuscone/actions/workflows/ci.yml/badge.svg)](https://github.com/osiabu/nexuscone/actions/workflows/ci.yml)
+[![CI](https://github.com/nexuscone/nexuscone/actions/workflows/ci.yml/badge.svg)](https://github.com/nexuscone/nexuscone/actions/workflows/ci.yml)
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/downloads/)
 [![License](https://img.shields.io/badge/license-Apache--2.0-green.svg)](LICENSE)
 [![Typed](https://img.shields.io/badge/typed-mypy%20strict-blue)](https://mypy-lang.org/)
@@ -112,7 +112,7 @@ Nexuscone is the extracted core of the audit chain that runs inside Metacarpal (
 ## Local development
 
 ```bash
-git clone https://github.com/osiabu/nexuscone.git
+git clone https://github.com/nexuscone/nexuscone.git
 cd nexuscone
 pip install -e ".[dev]"
 pytest tests/ -v

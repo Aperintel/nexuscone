@@ -55,9 +55,9 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/osiabu/nexuscone"
-Repository = "https://github.com/osiabu/nexuscone"
-Issues = "https://github.com/osiabu/nexuscone/issues"
+Homepage = "https://github.com/nexuscone/nexuscone"
+Repository = "https://github.com/nexuscone/nexuscone"
+Issues = "https://github.com/nexuscone/nexuscone/issues"
 
 [project.scripts]
 nexuscone-verify = "nexuscone.verifier:main"
