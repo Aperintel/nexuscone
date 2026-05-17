@@ -15,6 +15,8 @@ This is the package extracted from the audit ledger that ships inside Metacarpal
 
 ## Install
 
+> Note: PyPI release in flight. Until then install from source with `pip install git+https://github.com/nexuscone/nexuscone.git`.
+
 ```bash
 pip install nexuscone
 ```
