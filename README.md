@@ -2,8 +2,10 @@
 
 Tamper-evident append-only audit ledger with a SHA-256 hash chain and optional Ed25519 signing, designed for AI systems, agent platforms, and regulated software where every action needs to be provably unmodified after the fact.
 
+[![PyPI](https://img.shields.io/pypi/v/nexuscone.svg)](https://pypi.org/project/nexuscone/)
+[![Python](https://img.shields.io/pypi/pyversions/nexuscone.svg)](https://pypi.org/project/nexuscone/)
+[![Downloads](https://img.shields.io/pypi/dm/nexuscone.svg)](https://pypi.org/project/nexuscone/)
 [![CI](https://github.com/nexuscone/nexuscone/actions/workflows/ci.yml/badge.svg)](https://github.com/nexuscone/nexuscone/actions/workflows/ci.yml)
-[![Python](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/downloads/)
 [![License](https://img.shields.io/badge/license-Apache--2.0-green.svg)](LICENSE)
 [![Typed](https://img.shields.io/badge/typed-mypy%20strict-blue)](https://mypy-lang.org/)
 
@@ -14,8 +16,6 @@ Nexuscone is a small, dependency-light Python library that writes every audit ev
 This is the package extracted from the audit ledger that ships inside Metacarpal (a personal autonomous-agent operating system with twenty-one specialist agents and 150 passing tests) and the Aperintel AI Gateway (a multi-model AI router with a cryptographic audit chain on every request). It is the same chain logic, generalised into a standalone library so anyone building governance-first AI infrastructure can drop it into their stack without rebuilding the cryptographic primitives.
 
 ## Install
-
-> Note: PyPI release in flight. Until then install from source with `pip install git+https://github.com/nexuscone/nexuscone.git`.
 
 ```bash
 pip install nexuscone
