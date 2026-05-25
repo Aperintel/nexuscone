@@ -63,6 +63,19 @@ from nexuscone.schema import (
     ANCHORS_INDEX_CHAIN_HEAD,
     ANCHORS_INDEX_UNCONFIRMED,
     ANCHORS_TABLE_SQL,
+    GENESIS_WITNESS_PREV_HASH,
+    WITNESS_ATTESTATIONS_INDEX_HEAD,
+    WITNESS_ATTESTATIONS_INDEX_WITNESS,
+    WITNESS_ATTESTATIONS_TABLE_SQL,
+    WITNESSES_INDEX_ACTIVE,
+    WITNESSES_TABLE_SQL,
+)
+from nexuscone.witnesses import (
+    WITNESS_ROLE_CONSORTIUM,
+    WITNESS_ROLES,
+    Witness,
+    WitnessAttestation,
+    WitnessVerificationError,
 )
 
 GENESIS_PREVIOUS_HASH = "0" * 64
@@ -209,6 +222,67 @@ def _row_to_entry(row: aiosqlite.Row) -> LedgerEntry:
     )
 
 
+def _compute_witness_attestation_hash(
+    *,
+    witness_id: int,
+    chain_head_entry_id: int,
+    chain_head_hash: str,
+    signed_at: str,
+    prev_attestation_hash: str,
+) -> str:
+    """Hash one witness attestation over its five identifying fields.
+
+    Canonical JSON keeps field order and separator format deterministic
+    so the same five values always produce the same hex digest,
+    regardless of process or platform.
+    """
+    return sha256_hex(
+        canonical_json(
+            {
+                "witness_id": witness_id,
+                "chain_head_entry_id": chain_head_entry_id,
+                "chain_head_hash": chain_head_hash,
+                "signed_at": signed_at,
+                "prev_attestation_hash": prev_attestation_hash,
+            }
+        )
+    )
+
+
+def _row_to_witness(row: aiosqlite.Row) -> Witness:
+    retired_raw = row["retired_at"]
+    retired_at: datetime | None = (
+        datetime.fromisoformat(retired_raw.replace("Z", "+00:00"))
+        if retired_raw is not None
+        else None
+    )
+    return Witness(
+        witness_id=int(row["witness_id"]),
+        label=row["label"],
+        public_key_hex=row["public_key_hex"],
+        role=row["role"],
+        created_at=datetime.fromisoformat(
+            row["created_at"].replace("Z", "+00:00")
+        ),
+        retired_at=retired_at,
+    )
+
+
+def _row_to_witness_attestation(row: aiosqlite.Row) -> WitnessAttestation:
+    return WitnessAttestation(
+        attestation_id=int(row["attestation_id"]),
+        witness_id=int(row["witness_id"]),
+        chain_head_entry_id=int(row["chain_head_entry_id"]),
+        chain_head_hash=row["chain_head_hash"],
+        signed_at=datetime.fromisoformat(
+            row["signed_at"].replace("Z", "+00:00")
+        ),
+        prev_attestation_hash=row["prev_attestation_hash"],
+        attestation_hash=row["attestation_hash"],
+        signature_hex=row["signature_hex"],
+    )
+
+
 class Ledger:
     """Async SQLite-backed hash-chain audit ledger."""
 
@@ -260,6 +334,7 @@ class Ledger:
         await self._db.execute(_INDEX_TIMESTAMP)
         await self._db.execute(_INDEX_EVENT_TYPE)
         await self._ensure_anchors_table()
+        await self._ensure_witnesses_tables()
         await self._db.commit()
         self._initialised = True
 
@@ -309,6 +384,20 @@ class Ledger:
         await self._db.execute(ANCHORS_INDEX_CHAIN_HEAD)
         await self._db.execute(ANCHORS_INDEX_UNCONFIRMED)
         await self._migrate_anchors_columns()
+
+    async def _ensure_witnesses_tables(self) -> None:
+        """Create the witnesses and witness_attestations tables if missing.
+
+        Both tables are fresh in v0.2.0; databases already opened under
+        Phase 4 or 4b simply pick up the new CREATE TABLE IF NOT EXISTS
+        on the next open. No ALTER TABLE migration is required.
+        """
+        assert self._db is not None
+        await self._db.execute(WITNESSES_TABLE_SQL)
+        await self._db.execute(WITNESSES_INDEX_ACTIVE)
+        await self._db.execute(WITNESS_ATTESTATIONS_TABLE_SQL)
+        await self._db.execute(WITNESS_ATTESTATIONS_INDEX_WITNESS)
+        await self._db.execute(WITNESS_ATTESTATIONS_INDEX_HEAD)
 
     async def _migrate_anchors_columns(self) -> None:
         """Add tst_blob, tsa_url, and tsa_gen_time columns when missing.
@@ -766,6 +855,319 @@ class Ledger:
         async with db.execute("SELECT COUNT(*) FROM entries") as cursor:
             row = await cursor.fetchone()
         return int(row[0]) if row is not None else 0
+
+    async def register_witness(
+        self,
+        *,
+        label: str,
+        public_key_hex: str,
+        role: str = WITNESS_ROLE_CONSORTIUM,
+    ) -> Witness:
+        """Register a new witness identity.
+
+        label and public_key_hex are both UNIQUE in the witnesses table;
+        attempting to register a duplicate raises sqlite3.IntegrityError
+        (propagated through aiosqlite). role must be a member of
+        WITNESS_ROLES.
+        """
+        if role not in WITNESS_ROLES:
+            raise ValueError(
+                f"role must be one of {sorted(WITNESS_ROLES)}, got {role!r}"
+            )
+        db = self._require_db()
+        created_at = datetime.now(timezone.utc)
+        async with self._lock:
+            cursor = await db.execute(
+                "INSERT INTO witnesses (label, public_key_hex, role, created_at) "
+                "VALUES (?, ?, ?, ?)",
+                (
+                    label,
+                    public_key_hex,
+                    role,
+                    created_at.strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+                ),
+            )
+            witness_id = cursor.lastrowid
+            await db.commit()
+        return Witness(
+            witness_id=int(witness_id) if witness_id is not None else 0,
+            label=label,
+            public_key_hex=public_key_hex,
+            role=role,
+            created_at=created_at,
+        )
+
+    async def retire_witness(self, witness_id: int) -> Witness:
+        """Mark a witness retired.
+
+        Future attest_with_witness calls against this witness_id raise.
+        Existing attestations remain verifiable. Idempotent: retiring an
+        already-retired witness preserves the original retired_at.
+        """
+        db = self._require_db()
+        now = datetime.now(timezone.utc)
+        async with self._lock:
+            await db.execute(
+                "UPDATE witnesses SET retired_at = ? "
+                "WHERE witness_id = ? AND retired_at IS NULL",
+                (now.strftime("%Y-%m-%dT%H:%M:%S.%fZ"), witness_id),
+            )
+            await db.commit()
+        return await self._get_witness(witness_id)
+
+    async def list_witnesses(
+        self,
+        *,
+        include_retired: bool = False,
+    ) -> list[Witness]:
+        """Return all witnesses, ordered by witness_id.
+
+        Retired witnesses are excluded by default.
+        """
+        db = self._require_db()
+        sql = "SELECT * FROM witnesses"
+        if not include_retired:
+            sql += " WHERE retired_at IS NULL"
+        sql += " ORDER BY witness_id"
+        async with db.execute(sql) as cursor:
+            rows = await cursor.fetchall()
+        return [_row_to_witness(row) for row in rows]
+
+    async def _get_witness(self, witness_id: int) -> Witness:
+        db = self._require_db()
+        async with db.execute(
+            "SELECT * FROM witnesses WHERE witness_id = ?",
+            (witness_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        if row is None:
+            raise KeyError(f"No witness with witness_id={witness_id}")
+        return _row_to_witness(row)
+
+    async def _get_last_witness_attestation_hash(
+        self,
+        witness_id: int,
+    ) -> str:
+        db = self._require_db()
+        async with db.execute(
+            "SELECT attestation_hash FROM witness_attestations "
+            "WHERE witness_id = ? ORDER BY attestation_id DESC LIMIT 1",
+            (witness_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        if row is None:
+            return GENESIS_WITNESS_PREV_HASH
+        return str(row["attestation_hash"])
+
+    async def attest_with_witness(
+        self,
+        *,
+        witness_id: int,
+        signer: Signer,
+    ) -> WitnessAttestation | None:
+        """Have a witness sign the current chain head.
+
+        Returns None when the ledger has no entries to attest. Raises:
+            KeyError if witness_id does not exist.
+            RuntimeError if the witness is retired.
+            RuntimeError if the signer's key_id does not match the
+                witness's registered public key (defensive cross-check).
+        """
+        db = self._require_db()
+        async with self._lock:
+            witness = await self._get_witness(witness_id)
+            if witness.retired_at is not None:
+                raise RuntimeError(
+                    f"Witness {witness_id} ({witness.label}) is retired "
+                    f"and cannot sign new attestations."
+                )
+            if signer.key_id != witness.public_key_hex:
+                raise RuntimeError(
+                    f"signer.key_id does not match witness public key. "
+                    f"Witness {witness_id} registered "
+                    f"{witness.public_key_hex[:16]}..."
+                    f"; signer offered {signer.key_id[:16]}..."
+                )
+
+            latest_entry = await self._get_latest_entry_locked()
+            if latest_entry is None:
+                return None
+
+            prev_attestation_hash = await self._get_last_witness_attestation_hash(
+                witness_id
+            )
+
+            signed_at = datetime.now(timezone.utc)
+            signed_at_iso = signed_at.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+            attestation_hash = _compute_witness_attestation_hash(
+                witness_id=witness_id,
+                chain_head_entry_id=latest_entry.entry_id,
+                chain_head_hash=latest_entry.entry_hash,
+                signed_at=signed_at_iso,
+                prev_attestation_hash=prev_attestation_hash,
+            )
+            signature_bytes = signer.sign(bytes.fromhex(attestation_hash))
+            signature_hex = signature_bytes.hex()
+
+            cursor = await db.execute(
+                "INSERT INTO witness_attestations ("
+                "witness_id, chain_head_entry_id, chain_head_hash, "
+                "signed_at, prev_attestation_hash, attestation_hash, "
+                "signature_hex"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    witness_id,
+                    latest_entry.entry_id,
+                    latest_entry.entry_hash,
+                    signed_at_iso,
+                    prev_attestation_hash,
+                    attestation_hash,
+                    signature_hex,
+                ),
+            )
+            attestation_id = cursor.lastrowid
+            await db.commit()
+
+            return WitnessAttestation(
+                attestation_id=int(attestation_id) if attestation_id is not None else 0,
+                witness_id=witness_id,
+                chain_head_entry_id=latest_entry.entry_id,
+                chain_head_hash=latest_entry.entry_hash,
+                signed_at=signed_at,
+                prev_attestation_hash=prev_attestation_hash,
+                attestation_hash=attestation_hash,
+                signature_hex=signature_hex,
+            )
+
+    async def get_witness_attestations(
+        self,
+        *,
+        witness_id: int | None = None,
+        chain_head_entry_id: int | None = None,
+        since: str | None = None,
+        until: str | None = None,
+        limit: int = 500,
+    ) -> list[WitnessAttestation]:
+        """Query witness attestations with optional filters.
+
+        since / until are ISO-8601 UTC strings compared against
+        signed_at. Results are ordered by attestation_id ascending.
+        """
+        clauses: list[str] = []
+        params: list[Any] = []
+        if witness_id is not None:
+            clauses.append("witness_id = ?")
+            params.append(witness_id)
+        if chain_head_entry_id is not None:
+            clauses.append("chain_head_entry_id = ?")
+            params.append(chain_head_entry_id)
+        if since is not None:
+            clauses.append("signed_at >= ?")
+            params.append(since)
+        if until is not None:
+            clauses.append("signed_at <= ?")
+            params.append(until)
+        sql = "SELECT * FROM witness_attestations"
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += " ORDER BY attestation_id LIMIT ?"
+        params.append(int(limit))
+
+        db = self._require_db()
+        async with db.execute(sql, params) as cursor:
+            rows = await cursor.fetchall()
+        return [_row_to_witness_attestation(row) for row in rows]
+
+    async def verify_witness_attestations(
+        self,
+        verifier: Verifier,
+    ) -> int:
+        """Walk every witness attestation and verify it end-to-end.
+
+        For each attestation:
+          - Recompute attestation_hash from the stored fields.
+          - Check the per-witness sub-chain link via
+            prev_attestation_hash.
+          - Verify the Ed25519 signature against the witness's
+            registered public key (looked up as the verifier's key_id).
+
+        Returns the number of attestations verified. Raises
+        WitnessVerificationError on any mismatch, with the offending
+        attestation_id and witness_id in the message.
+        """
+        db = self._require_db()
+        async with db.execute("SELECT * FROM witnesses") as witness_cursor:
+            witness_rows = await witness_cursor.fetchall()
+        witnesses_by_id: dict[int, Witness] = {
+            int(row["witness_id"]): _row_to_witness(row) for row in witness_rows
+        }
+
+        expected_prev: dict[int, str] = {}
+        verified = 0
+
+        async with db.execute(
+            "SELECT * FROM witness_attestations "
+            "ORDER BY witness_id, attestation_id"
+        ) as cursor:
+            async for row in cursor:
+                attestation_id = int(row["attestation_id"])
+                witness_id = int(row["witness_id"])
+                witness = witnesses_by_id.get(witness_id)
+                if witness is None:
+                    raise WitnessVerificationError(
+                        f"Attestation {attestation_id} references "
+                        f"witness_id={witness_id} which does not exist."
+                    )
+
+                prev = expected_prev.get(witness_id, GENESIS_WITNESS_PREV_HASH)
+                stored_prev = str(row["prev_attestation_hash"])
+                if stored_prev != prev:
+                    raise WitnessVerificationError(
+                        f"Attestation {attestation_id} from witness "
+                        f"{witness_id} ({witness.label}) "
+                        f"prev_attestation_hash mismatch: expected {prev}, "
+                        f"stored {stored_prev}"
+                    )
+
+                recomputed = _compute_witness_attestation_hash(
+                    witness_id=witness_id,
+                    chain_head_entry_id=int(row["chain_head_entry_id"]),
+                    chain_head_hash=row["chain_head_hash"],
+                    signed_at=row["signed_at"],
+                    prev_attestation_hash=stored_prev,
+                )
+                if recomputed != row["attestation_hash"]:
+                    raise WitnessVerificationError(
+                        f"Attestation {attestation_id} from witness "
+                        f"{witness_id} ({witness.label}) "
+                        f"attestation_hash mismatch: expected {recomputed}, "
+                        f"stored {row['attestation_hash']}"
+                    )
+
+                try:
+                    ok = verifier.verify(
+                        witness.public_key_hex,
+                        bytes.fromhex(recomputed),
+                        bytes.fromhex(row["signature_hex"]),
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    raise WitnessVerificationError(
+                        f"Attestation {attestation_id} from witness "
+                        f"{witness_id} ({witness.label}) "
+                        f"signature verification raised: {exc!r}"
+                    ) from exc
+                if not ok:
+                    raise WitnessVerificationError(
+                        f"Attestation {attestation_id} from witness "
+                        f"{witness_id} ({witness.label}) "
+                        f"signature verification failed."
+                    )
+
+                expected_prev[witness_id] = str(row["attestation_hash"])
+                verified += 1
+
+        return verified
 
     def _require_db(self) -> aiosqlite.Connection:
         if self._db is None or not self._initialised:
