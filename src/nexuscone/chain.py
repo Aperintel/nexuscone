@@ -45,7 +45,7 @@ from __future__ import annotations
 import asyncio
 import json
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import TracebackType
 from typing import Any, Protocol
@@ -280,6 +280,41 @@ def _row_to_witness_attestation(row: aiosqlite.Row) -> WitnessAttestation:
         prev_attestation_hash=row["prev_attestation_hash"],
         attestation_hash=row["attestation_hash"],
         signature_hex=row["signature_hex"],
+    )
+
+
+def _row_to_anchor(row: aiosqlite.Row) -> AnchorRecord:
+    """Reconstruct an AnchorRecord from a SQLite row.
+
+    calendar_servers is stored as JSON in TEXT; both anchor tracks
+    contribute optional columns that may be NULL when one track failed
+    or never ran.
+    """
+
+    def _parse_iso(value: str | None) -> datetime | None:
+        if value is None:
+            return None
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+    return AnchorRecord(
+        anchor_id=int(row["anchor_id"]),
+        chain_head_hash=row["chain_head_hash"],
+        chain_head_entry_id=int(row["chain_head_entry_id"]),
+        submitted_at=datetime.fromisoformat(
+            row["submitted_at"].replace("Z", "+00:00")
+        ),
+        calendar_servers=list(json.loads(row["calendar_servers"])),
+        ots_proof_blob=row["ots_proof_blob"],
+        confirmed_at=_parse_iso(row["confirmed_at"]),
+        bitcoin_block_height=(
+            int(row["bitcoin_block_height"])
+            if row["bitcoin_block_height"] is not None
+            else None
+        ),
+        bitcoin_block_hash=row["bitcoin_block_hash"],
+        tst_blob=row["tst_blob"],
+        tsa_url=row["tsa_url"],
+        tsa_gen_time=_parse_iso(row["tsa_gen_time"]),
     )
 
 
@@ -855,6 +890,85 @@ class Ledger:
         async with db.execute("SELECT COUNT(*) FROM entries") as cursor:
             row = await cursor.fetchone()
         return int(row[0]) if row is not None else 0
+
+    async def list_unconfirmed_anchors(
+        self,
+        *,
+        max_age_minutes: int | None = None,
+        limit: int = 500,
+    ) -> list[AnchorRecord]:
+        """Return anchors with confirmed_at NULL and ots_proof_blob NOT NULL.
+
+        Ordered by anchor_id ascending. max_age_minutes optionally
+        filters to anchors submitted within the given window, so the
+        background poller can skip anchors older than the typical
+        Bitcoin confirmation lag (~24 hours by default in the poller).
+        """
+        db = self._require_db()
+        clauses = [
+            "confirmed_at IS NULL",
+            "ots_proof_blob IS NOT NULL",
+        ]
+        params: list[Any] = []
+        if max_age_minutes is not None:
+            cutoff = datetime.now(timezone.utc) - timedelta(
+                minutes=max_age_minutes
+            )
+            clauses.append("submitted_at >= ?")
+            params.append(cutoff.strftime("%Y-%m-%dT%H:%M:%S.%fZ"))
+        sql = (
+            "SELECT * FROM anchors WHERE "
+            + " AND ".join(clauses)
+            + " ORDER BY anchor_id LIMIT ?"
+        )
+        params.append(int(limit))
+        async with db.execute(sql, params) as cursor:
+            rows = await cursor.fetchall()
+        return [_row_to_anchor(row) for row in rows]
+
+    async def confirm_anchor(
+        self,
+        *,
+        anchor_id: int,
+        upgraded_proof_blob: bytes,
+        bitcoin_block_height: int,
+        bitcoin_block_hash: str | None,
+        confirmed_at: datetime | None = None,
+    ) -> AnchorRecord:
+        """Persist a Bitcoin-confirmed proof on an existing anchor row.
+
+        Updates ots_proof_blob with the upgraded serialisation,
+        populates bitcoin_block_height and bitcoin_block_hash, and
+        stamps confirmed_at. Returns the refreshed AnchorRecord.
+
+        Raises KeyError if anchor_id does not exist.
+        """
+        confirmed_at = confirmed_at or datetime.now(timezone.utc)
+        db = self._require_db()
+        async with self._lock:
+            await db.execute(
+                "UPDATE anchors SET "
+                "ots_proof_blob = ?, "
+                "bitcoin_block_height = ?, "
+                "bitcoin_block_hash = ?, "
+                "confirmed_at = ? "
+                "WHERE anchor_id = ?",
+                (
+                    upgraded_proof_blob,
+                    bitcoin_block_height,
+                    bitcoin_block_hash,
+                    confirmed_at.strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+                    anchor_id,
+                ),
+            )
+            await db.commit()
+        async with db.execute(
+            "SELECT * FROM anchors WHERE anchor_id = ?", (anchor_id,)
+        ) as cursor:
+            row = await cursor.fetchone()
+        if row is None:
+            raise KeyError(f"No anchor with anchor_id={anchor_id}")
+        return _row_to_anchor(row)
 
     async def register_witness(
         self,
