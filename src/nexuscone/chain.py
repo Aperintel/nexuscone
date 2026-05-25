@@ -14,6 +14,30 @@ entry_hash check to fail and cascades into the next row's previous_hash check.
 Signatures are optional. When a Signer is provided to log, the entry_hash is
 also signed with Ed25519 and the signature plus signing_key_id are stored on
 the row. A Verifier provided to verify_chain checks every signed row.
+
+Chain format versions:
+
+  format_version=1 (v0.1.0, legacy): hash inputs are entry_id, timestamp,
+                                     actor, action, payload, previous_hash.
+  format_version=2 (v0.2.0 and later): hash inputs are entry_id, timestamp,
+                                       actor, action, event_type, payload,
+                                       previous_hash. Including event_type in
+                                       the hash means a tampering admin
+                                       cannot change a 'request' row into a
+                                       'cost_anomaly' row without detection.
+
+New writes always use format_version=2. Legacy v0.1.0 databases continue to
+verify under format_version=1; the verifier dispatches per-row.
+
+Event types:
+
+  Every entry carries an event_type discriminator. 'request' is the default
+  and covers normal LLM/agent calls. The other types fire when an anomaly is
+  detected and write their own chain entries so the audit timeline includes
+  drift, scope violations, guardrail bypasses, and chain integrity breaks
+  alongside ordinary traffic. The recognised types live in
+  nexuscone.EVENT_TYPES; arbitrary strings are accepted at write time so
+  downstream tools can extend the discriminator without forking nexuscone.
 """
 
 from __future__ import annotations
@@ -32,12 +56,47 @@ from nexuscone.canonical import canonical_json, sha256_hex
 
 GENESIS_PREVIOUS_HASH = "0" * 64
 
+# Default event_type for ordinary write paths.
+EVENT_TYPE_REQUEST = "request"
+
+# Recognised drift / anomaly event types. Strings, not an Enum, so downstream
+# tooling can extend the set without subclassing or forking. Hyperaxis writes
+# these from its drift detectors; the chain treats them like any other entry.
+EVENT_TYPE_SCHEMA_DRIFT = "schema_drift"
+EVENT_TYPE_COST_ANOMALY = "cost_anomaly"
+EVENT_TYPE_PROVIDER_DRIFT = "provider_drift"
+EVENT_TYPE_GUARDRAIL_BYPASS = "guardrail_bypass"
+EVENT_TYPE_UNSIGNED_PROMPT_CHANGE = "unsigned_prompt_change"
+EVENT_TYPE_SCOPE_VIOLATION = "scope_violation"
+EVENT_TYPE_CHAIN_BREAK = "chain_break"
+EVENT_TYPE_BEHAVIOUR_DRIFT = "behaviour_drift"
+
+EVENT_TYPES: frozenset[str] = frozenset(
+    {
+        EVENT_TYPE_REQUEST,
+        EVENT_TYPE_SCHEMA_DRIFT,
+        EVENT_TYPE_COST_ANOMALY,
+        EVENT_TYPE_PROVIDER_DRIFT,
+        EVENT_TYPE_GUARDRAIL_BYPASS,
+        EVENT_TYPE_UNSIGNED_PROMPT_CHANGE,
+        EVENT_TYPE_SCOPE_VIOLATION,
+        EVENT_TYPE_CHAIN_BREAK,
+        EVENT_TYPE_BEHAVIOUR_DRIFT,
+    }
+)
+
+# Current chain hash format. New writes always use this version. Legacy rows
+# loaded from a v0.1.0 database are verified under format_version=1.
+CURRENT_FORMAT_VERSION = 2
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS entries (
     entry_id        INTEGER PRIMARY KEY AUTOINCREMENT,
     timestamp       TEXT    NOT NULL,
     actor           TEXT    NOT NULL,
     action          TEXT    NOT NULL,
+    event_type      TEXT    NOT NULL DEFAULT 'request',
+    format_version  INTEGER NOT NULL DEFAULT 2,
     payload         TEXT    NOT NULL,
     previous_hash   TEXT    NOT NULL,
     entry_hash      TEXT    NOT NULL,
@@ -48,6 +107,7 @@ CREATE TABLE IF NOT EXISTS entries (
 
 _INDEX_ACTOR = "CREATE INDEX IF NOT EXISTS idx_entries_actor ON entries(actor)"
 _INDEX_TIMESTAMP = "CREATE INDEX IF NOT EXISTS idx_entries_ts ON entries(timestamp)"
+_INDEX_EVENT_TYPE = "CREATE INDEX IF NOT EXISTS idx_entries_event_type ON entries(event_type)"
 
 
 @dataclass(frozen=True, slots=True)
@@ -63,6 +123,8 @@ class LedgerEntry:
     entry_hash: str
     signature: str | None
     signing_key_id: str | None
+    event_type: str = EVENT_TYPE_REQUEST
+    format_version: int = CURRENT_FORMAT_VERSION
 
 
 class Signer(Protocol):
@@ -96,19 +158,26 @@ def _compute_entry_hash(
     action: str,
     payload_canonical: str,
     previous_hash: str,
+    event_type: str,
+    format_version: int,
 ) -> str:
-    return sha256_hex(
-        canonical_json(
-            {
-                "entry_id": entry_id,
-                "timestamp": timestamp,
-                "actor": actor,
-                "action": action,
-                "payload": payload_canonical,
-                "previous_hash": previous_hash,
-            }
-        )
-    )
+    """Compute the entry hash for the given format version.
+
+    format_version=1 (legacy v0.1.0) excludes event_type from the inputs.
+    format_version=2 (v0.2.0+) includes event_type so it is covered by the
+    tamper-evident chain.
+    """
+    fields: dict[str, Any] = {
+        "entry_id": entry_id,
+        "timestamp": timestamp,
+        "actor": actor,
+        "action": action,
+        "payload": payload_canonical,
+        "previous_hash": previous_hash,
+    }
+    if format_version >= 2:
+        fields["event_type"] = event_type
+    return sha256_hex(canonical_json(fields))
 
 
 def _row_to_entry(row: aiosqlite.Row) -> LedgerEntry:
@@ -122,6 +191,10 @@ def _row_to_entry(row: aiosqlite.Row) -> LedgerEntry:
         entry_hash=row["entry_hash"],
         signature=row["signature"],
         signing_key_id=row["signing_key_id"],
+        event_type=row["event_type"] if "event_type" in row.keys() else EVENT_TYPE_REQUEST,
+        format_version=(
+            int(row["format_version"]) if "format_version" in row.keys() else 1
+        ),
     )
 
 
@@ -147,17 +220,52 @@ class Ledger:
         await self.close()
 
     async def init(self) -> None:
-        """Open the database, create the entries table and indexes if missing."""
+        """Open the database, create the entries table and indexes if missing.
+
+        Idempotently migrates v0.1.0 databases to v0.2.0 by adding the
+        event_type and format_version columns when they are missing. Legacy
+        rows receive format_version=1 so they continue to verify under the
+        v0.1.0 hash formula; new writes use format_version=2 explicitly.
+        """
         if self._initialised:
             return
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
         self._db = await aiosqlite.connect(self._db_path)
         self._db.row_factory = aiosqlite.Row
         await self._db.execute(_SCHEMA)
+        # Migrate legacy columns BEFORE creating indexes that depend on them,
+        # otherwise CREATE INDEX on event_type fails on a v0.1.0 table.
+        await self._migrate_legacy_columns()
         await self._db.execute(_INDEX_ACTOR)
         await self._db.execute(_INDEX_TIMESTAMP)
+        await self._db.execute(_INDEX_EVENT_TYPE)
         await self._db.commit()
         self._initialised = True
+
+    async def _migrate_legacy_columns(self) -> None:
+        """Add event_type and format_version columns to legacy v0.1.0 tables.
+
+        Pre-existing rows in a v0.1.0 database are assigned format_version=1
+        (so they continue to verify under the legacy hash formula) and
+        event_type='request' (which does not affect the v1 hash since v1
+        excludes event_type from inputs).
+        """
+        assert self._db is not None
+        async with self._db.execute("PRAGMA table_info(entries)") as cursor:
+            columns = {row["name"] for row in await cursor.fetchall()}
+
+        if "event_type" not in columns:
+            await self._db.execute(
+                "ALTER TABLE entries ADD COLUMN event_type TEXT NOT NULL "
+                "DEFAULT 'request'"
+            )
+        if "format_version" not in columns:
+            # Legacy rows: format_version=1 so existing entry_hash values
+            # continue to verify under the v0.1.0 hash formula.
+            await self._db.execute(
+                "ALTER TABLE entries ADD COLUMN format_version INTEGER NOT NULL "
+                "DEFAULT 1"
+            )
 
     async def close(self) -> None:
         """Close the underlying SQLite connection."""
@@ -173,8 +281,15 @@ class Ledger:
         action: str,
         payload: dict[str, Any] | None = None,
         signer: Signer | None = None,
+        event_type: str = EVENT_TYPE_REQUEST,
     ) -> LedgerEntry:
-        """Append a new entry to the chain and return the stored row."""
+        """Append a new entry to the chain and return the stored row.
+
+        event_type is a free-form string used to discriminate ordinary
+        request entries from drift / anomaly entries. The well-known values
+        are exposed as EVENT_TYPE_* constants in this module; callers may
+        also pass custom strings for their own categorisations.
+        """
         db = self._require_db()
         payload_dict: dict[str, Any] = payload or {}
         async with self._lock:
@@ -200,6 +315,8 @@ class Ledger:
                 action=action,
                 payload_canonical=payload_canonical,
                 previous_hash=previous_hash,
+                event_type=event_type,
+                format_version=CURRENT_FORMAT_VERSION,
             )
 
             signature_hex: str | None = None
@@ -210,14 +327,16 @@ class Ledger:
 
             await db.execute(
                 "INSERT INTO entries ("
-                "entry_id, timestamp, actor, action, payload, previous_hash, "
-                "entry_hash, signature, signing_key_id"
-                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "entry_id, timestamp, actor, action, event_type, format_version, "
+                "payload, previous_hash, entry_hash, signature, signing_key_id"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     next_id,
                     timestamp,
                     actor,
                     action,
+                    event_type,
+                    CURRENT_FORMAT_VERSION,
                     payload_canonical,
                     previous_hash,
                     entry_hash,
@@ -237,6 +356,8 @@ class Ledger:
                 entry_hash=entry_hash,
                 signature=signature_hex,
                 signing_key_id=signing_key_id,
+                event_type=event_type,
+                format_version=CURRENT_FORMAT_VERSION,
             )
 
     async def verify_chain(self, verifier: Verifier | None = None) -> int:
@@ -260,6 +381,13 @@ class Ledger:
                     f"entry {entry_id} previous_hash mismatch: "
                     f"expected {expected_previous}, stored {stored_previous}"
                 )
+            row_columns = row.keys()
+            row_event_type = (
+                row["event_type"] if "event_type" in row_columns else EVENT_TYPE_REQUEST
+            )
+            row_format_version = (
+                int(row["format_version"]) if "format_version" in row_columns else 1
+            )
             recomputed = _compute_entry_hash(
                 entry_id=entry_id,
                 timestamp=row["timestamp"],
@@ -267,6 +395,8 @@ class Ledger:
                 action=row["action"],
                 payload_canonical=row["payload"],
                 previous_hash=stored_previous,
+                event_type=row_event_type,
+                format_version=row_format_version,
             )
             if recomputed != row["entry_hash"]:
                 raise ChainVerificationError(
@@ -303,6 +433,7 @@ class Ledger:
         *,
         actor: str | None = None,
         action: str | None = None,
+        event_type: str | None = None,
         start: str | None = None,
         end: str | None = None,
         limit: int = 500,
@@ -318,6 +449,9 @@ class Ledger:
         if action is not None:
             clauses.append("action = ?")
             params.append(action)
+        if event_type is not None:
+            clauses.append("event_type = ?")
+            params.append(event_type)
         if start is not None:
             clauses.append("timestamp >= ?")
             params.append(start)
