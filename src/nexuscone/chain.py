@@ -51,7 +51,12 @@ from types import TracebackType
 from typing import Any, Protocol
 
 import aiosqlite
+from opentimestamps.calendar import RemoteCalendar
+from opentimestamps.core.serialize import BytesSerializationContext
+from opentimestamps.core.timestamp import Timestamp
 
+from nexuscone.anchor_schedule import AnchorSchedule
+from nexuscone.anchors import AnchorRecord
 from nexuscone.canonical import canonical_json, sha256_hex
 from nexuscone.schema import (
     ANCHORS_INDEX_CHAIN_HEAD,
@@ -206,11 +211,17 @@ def _row_to_entry(row: aiosqlite.Row) -> LedgerEntry:
 class Ledger:
     """Async SQLite-backed hash-chain audit ledger."""
 
-    def __init__(self, db_path: Path | str) -> None:
+    def __init__(
+        self,
+        db_path: Path | str,
+        *,
+        anchor_schedule: AnchorSchedule | None = None,
+    ) -> None:
         self._db_path: Path = Path(db_path)
         self._db: aiosqlite.Connection | None = None
         self._lock = asyncio.Lock()
         self._initialised = False
+        self._anchor_schedule = anchor_schedule
 
     async def __aenter__(self) -> Ledger:
         await self.init()
@@ -287,6 +298,150 @@ class Ledger:
         await self._db.execute(ANCHORS_TABLE_SQL)
         await self._db.execute(ANCHORS_INDEX_CHAIN_HEAD)
         await self._db.execute(ANCHORS_INDEX_UNCONFIRMED)
+
+    async def anchor(
+        self,
+        schedule: AnchorSchedule | None = None,
+    ) -> AnchorRecord | None:
+        """Submit the current chain head to OpenTimestamps calendar servers.
+
+        Returns the new AnchorRecord with submitted_at set and confirmed_at,
+        bitcoin_block_height, and bitcoin_block_hash all None. Bitcoin
+        confirmation lands later via the background poller that upgrades
+        pending proofs once a block containing the calendar's aggregation
+        Merkle root is mined.
+
+        Returns None when the ledger has no entries to anchor.
+
+        Raises RuntimeError when no AnchorSchedule is configured (neither
+        passed in nor set on the Ledger) or when the schedule is disabled,
+        or when every calendar server in the schedule fails to accept the
+        submission.
+
+        Calendar submissions are best-effort across the configured set:
+        if some calendars succeed and others fail, the anchor is persisted
+        citing only the successful ones (a partial-anchor proof is still
+        cryptographically valid). The opentimestamps-client calendar API
+        is synchronous, so each submission is wrapped in run_in_executor
+        to keep the Ledger interface async-friendly.
+        """
+        schedule = schedule or self._anchor_schedule
+        if schedule is None or not schedule.enabled:
+            raise RuntimeError(
+                "Cannot anchor: no AnchorSchedule configured, or schedule "
+                "is disabled. Construct Ledger(..., anchor_schedule=...) "
+                "with enabled=True, or pass a schedule explicitly."
+            )
+
+        async with self._lock:
+            latest_entry = await self._get_latest_entry_locked()
+            if latest_entry is None:
+                return None
+
+            head_hash_bytes = bytes.fromhex(latest_entry.entry_hash)
+            loop = asyncio.get_running_loop()
+
+            merged_timestamp = Timestamp(head_hash_bytes)
+            successful_calendars: list[str] = []
+            errors: dict[str, str] = {}
+
+            for calendar_url in schedule.calendar_servers:
+                try:
+                    partial = await loop.run_in_executor(
+                        None,
+                        self._submit_to_calendar,
+                        head_hash_bytes,
+                        calendar_url,
+                    )
+                except Exception as exc:
+                    errors[calendar_url] = repr(exc)
+                    continue
+                merged_timestamp.merge(partial)
+                successful_calendars.append(calendar_url)
+
+            if not successful_calendars:
+                raise RuntimeError(
+                    f"All calendar servers failed: {errors}"
+                )
+
+            proof_ctx = BytesSerializationContext()
+            merged_timestamp.serialize(proof_ctx)
+            proof_blob = proof_ctx.getbytes()
+
+            return await self._insert_anchor_locked(
+                chain_head_hash=latest_entry.entry_hash,
+                chain_head_entry_id=latest_entry.entry_id,
+                ots_proof_blob=proof_blob,
+                calendar_servers=successful_calendars,
+            )
+
+    @staticmethod
+    def _submit_to_calendar(
+        digest: bytes,
+        calendar_url: str,
+        timeout_seconds: int = 30,
+    ) -> Timestamp:
+        """Synchronous calendar submission, run inside the default executor.
+
+        Wraps opentimestamps.calendar.RemoteCalendar.submit so the async
+        anchor() method can call it via loop.run_in_executor without each
+        callsite repeating the RemoteCalendar construction.
+        """
+        return RemoteCalendar(calendar_url).submit(digest, timeout=timeout_seconds)
+
+    async def _get_latest_entry_locked(self) -> LedgerEntry | None:
+        """Return the highest-entry_id row, or None on an empty ledger.
+
+        Caller must already hold self._lock.
+        """
+        db = self._require_db()
+        async with db.execute(
+            "SELECT * FROM entries ORDER BY entry_id DESC LIMIT 1"
+        ) as cursor:
+            row = await cursor.fetchone()
+        if row is None:
+            return None
+        return _row_to_entry(row)
+
+    async def _insert_anchor_locked(
+        self,
+        *,
+        chain_head_hash: str,
+        chain_head_entry_id: int,
+        ots_proof_blob: bytes,
+        calendar_servers: list[str],
+    ) -> AnchorRecord:
+        """Persist an anchor row and return the AnchorRecord with its id.
+
+        Caller must already hold self._lock. calendar_servers is stored as
+        a JSON-encoded string in the calendar_servers TEXT column so a URL
+        containing punctuation does not corrupt the round-trip.
+        """
+        db = self._require_db()
+        submitted_at = datetime.now(timezone.utc)
+        cursor = await db.execute(
+            "INSERT INTO anchors ("
+            "chain_head_hash, chain_head_entry_id, ots_proof_blob, "
+            "submitted_at, calendar_servers"
+            ") VALUES (?, ?, ?, ?, ?)",
+            (
+                chain_head_hash,
+                chain_head_entry_id,
+                ots_proof_blob,
+                submitted_at.strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+                json.dumps(calendar_servers),
+            ),
+        )
+        anchor_id = cursor.lastrowid
+        await db.commit()
+        return AnchorRecord(
+            anchor_id=int(anchor_id) if anchor_id is not None else 0,
+            chain_head_hash=chain_head_hash,
+            chain_head_entry_id=chain_head_entry_id,
+            ots_proof_blob=ots_proof_blob,
+            submitted_at=submitted_at,
+            calendar_servers=list(calendar_servers),
+        )
 
     async def close(self) -> None:
         """Close the underlying SQLite connection."""
