@@ -18,12 +18,15 @@ CREATE TABLE IF NOT EXISTS anchors (
     anchor_id            INTEGER PRIMARY KEY AUTOINCREMENT,
     chain_head_hash      TEXT    NOT NULL,
     chain_head_entry_id  INTEGER NOT NULL,
-    ots_proof_blob       BLOB    NOT NULL,
+    ots_proof_blob       BLOB,
     submitted_at         TEXT    NOT NULL,
     calendar_servers     TEXT    NOT NULL,
     confirmed_at         TEXT,
     bitcoin_block_height INTEGER,
     bitcoin_block_hash   TEXT,
+    tst_blob             BLOB,
+    tsa_url              TEXT,
+    tsa_gen_time         TEXT,
     FOREIGN KEY (chain_head_entry_id) REFERENCES entries(entry_id)
 )
 """

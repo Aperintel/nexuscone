@@ -58,6 +58,7 @@ from opentimestamps.core.timestamp import Timestamp
 from nexuscone.anchor_schedule import AnchorSchedule
 from nexuscone.anchors import AnchorRecord
 from nexuscone.canonical import canonical_json, sha256_hex
+from nexuscone.rfc3161 import TSAError, TSAResponse, submit_to_tsa
 from nexuscone.schema import (
     ANCHORS_INDEX_CHAIN_HEAD,
     ANCHORS_INDEX_UNCONFIRMED,
@@ -290,40 +291,82 @@ class Ledger:
     async def _ensure_anchors_table(self) -> None:
         """Create the anchors table and its two indexes if missing.
 
-        Idempotent: re-running on a database that already has the table is
-        a no-op thanks to IF NOT EXISTS. The anchors table stores
-        OpenTimestamps proofs that bind chain heads to Bitcoin blocks.
+        Idempotent: re-running on a database that already has the table
+        is a no-op thanks to IF NOT EXISTS. The anchors table stores
+        OpenTimestamps proofs that bind chain heads to Bitcoin blocks
+        and RFC 3161 TimeStampTokens that bind chain heads to a TSA's
+        signed time attestation.
+
+        Also migrates pre-Phase-4b anchor tables forward by ALTER TABLE
+        adding tst_blob, tsa_url, and tsa_gen_time columns when they are
+        missing. SQLite cannot drop a NOT NULL constraint with ALTER
+        TABLE, so any existing table whose ots_proof_blob column was
+        created NOT NULL stays that way; the v0.2.0 release schema
+        creates it nullable from the start.
         """
         assert self._db is not None
         await self._db.execute(ANCHORS_TABLE_SQL)
         await self._db.execute(ANCHORS_INDEX_CHAIN_HEAD)
         await self._db.execute(ANCHORS_INDEX_UNCONFIRMED)
+        await self._migrate_anchors_columns()
+
+    async def _migrate_anchors_columns(self) -> None:
+        """Add tst_blob, tsa_url, and tsa_gen_time columns when missing.
+
+        Pre-Phase-4b databases (an older anchors table from a Phase 4
+        dev build) gain the three new columns idempotently. Newly
+        created tables already have them via ANCHORS_TABLE_SQL.
+        """
+        assert self._db is not None
+        async with self._db.execute("PRAGMA table_info(anchors)") as cursor:
+            columns = {row["name"] for row in await cursor.fetchall()}
+
+        if "tst_blob" not in columns:
+            await self._db.execute("ALTER TABLE anchors ADD COLUMN tst_blob BLOB")
+        if "tsa_url" not in columns:
+            await self._db.execute("ALTER TABLE anchors ADD COLUMN tsa_url TEXT")
+        if "tsa_gen_time" not in columns:
+            await self._db.execute("ALTER TABLE anchors ADD COLUMN tsa_gen_time TEXT")
 
     async def anchor(
         self,
         schedule: AnchorSchedule | None = None,
     ) -> AnchorRecord | None:
-        """Submit the current chain head to OpenTimestamps calendar servers.
+        """Submit the current chain head to OpenTimestamps and an RFC 3161 TSA.
 
-        Returns the new AnchorRecord with submitted_at set and confirmed_at,
+        Two parallel proof tracks run for every anchor:
+
+          1. OpenTimestamps: each calendar URL in the schedule is
+             contacted in turn. Successful calendars contribute
+             attestations that are merged into one Timestamp and
+             serialised into ots_proof_blob.
+          2. RFC 3161: the first TSA URL in the schedule is contacted.
+             A signed TimeStampToken response is persisted into
+             tst_blob alongside the TSA URL and the genTime parsed
+             from inside the token.
+
+        Either track may fail entirely without blocking the other; the
+        anchor row records whichever tracks succeeded. If both tracks
+        fail, RuntimeError is raised with the per-track errors and no
+        anchor row is written.
+
+        Returns the new AnchorRecord with submitted_at set, confirmed_at,
         bitcoin_block_height, and bitcoin_block_hash all None. Bitcoin
-        confirmation lands later via the background poller that upgrades
-        pending proofs once a block containing the calendar's aggregation
-        Merkle root is mined.
+        confirmation for the OpenTimestamps proof lands later via the
+        background poller. The TSA's tsa_gen_time field is set
+        immediately on the returned record because the TST is signed
+        on receipt.
 
         Returns None when the ledger has no entries to anchor.
 
         Raises RuntimeError when no AnchorSchedule is configured (neither
-        passed in nor set on the Ledger) or when the schedule is disabled,
-        or when every calendar server in the schedule fails to accept the
-        submission.
+        passed in nor set on the Ledger), when the schedule is disabled,
+        or when every configured calendar server AND every configured
+        TSA URL fail to accept the submission.
 
-        Calendar submissions are best-effort across the configured set:
-        if some calendars succeed and others fail, the anchor is persisted
-        citing only the successful ones (a partial-anchor proof is still
-        cryptographically valid). The opentimestamps-client calendar API
-        is synchronous, so each submission is wrapped in run_in_executor
-        to keep the Ledger interface async-friendly.
+        The opentimestamps and rfc3161 client libraries are synchronous,
+        so each submission is wrapped in run_in_executor to keep the
+        Ledger interface async-friendly.
         """
         schedule = schedule or self._anchor_schedule
         if schedule is None or not schedule.enabled:
@@ -341,39 +384,98 @@ class Ledger:
             head_hash_bytes = bytes.fromhex(latest_entry.entry_hash)
             loop = asyncio.get_running_loop()
 
-            merged_timestamp = Timestamp(head_hash_bytes)
-            successful_calendars: list[str] = []
-            errors: dict[str, str] = {}
+            ots_result = await self._submit_ots_track(
+                head_hash_bytes, schedule.calendar_servers, loop
+            )
+            successful_calendars, ots_proof_blob, ots_errors = ots_result
 
-            for calendar_url in schedule.calendar_servers:
-                try:
-                    partial = await loop.run_in_executor(
-                        None,
-                        self._submit_to_calendar,
-                        head_hash_bytes,
-                        calendar_url,
-                    )
-                except Exception as exc:
-                    errors[calendar_url] = repr(exc)
-                    continue
-                merged_timestamp.merge(partial)
-                successful_calendars.append(calendar_url)
+            tsa_response, tsa_error = await self._submit_tsa_track(
+                head_hash_bytes, schedule.tsa_urls, loop
+            )
 
-            if not successful_calendars:
+            if not successful_calendars and tsa_response is None:
                 raise RuntimeError(
-                    f"All calendar servers failed: {errors}"
+                    "Both anchor tracks failed. "
+                    f"OTS errors: {ots_errors}. TSA error: {tsa_error!r}"
                 )
-
-            proof_ctx = BytesSerializationContext()
-            merged_timestamp.serialize(proof_ctx)
-            proof_blob = proof_ctx.getbytes()
 
             return await self._insert_anchor_locked(
                 chain_head_hash=latest_entry.entry_hash,
                 chain_head_entry_id=latest_entry.entry_id,
-                ots_proof_blob=proof_blob,
+                ots_proof_blob=ots_proof_blob,
                 calendar_servers=successful_calendars,
+                tsa_response=tsa_response,
             )
+
+    async def _submit_ots_track(
+        self,
+        head_hash_bytes: bytes,
+        calendar_servers: list[str],
+        loop: asyncio.AbstractEventLoop,
+    ) -> tuple[list[str], bytes | None, dict[str, str]]:
+        """Submit to every OpenTimestamps calendar URL in turn.
+
+        Returns (successful_urls, serialised_proof_or_None, per_url_errors).
+        The serialised proof is None when no calendar accepted the
+        submission. Errors are still returned even on overall success so
+        the caller can log partial failures.
+        """
+        merged_timestamp = Timestamp(head_hash_bytes)
+        successful_calendars: list[str] = []
+        errors: dict[str, str] = {}
+
+        for calendar_url in calendar_servers:
+            try:
+                partial = await loop.run_in_executor(
+                    None,
+                    self._submit_to_calendar,
+                    head_hash_bytes,
+                    calendar_url,
+                )
+            except Exception as exc:  # noqa: BLE001
+                errors[calendar_url] = repr(exc)
+                continue
+            merged_timestamp.merge(partial)
+            successful_calendars.append(calendar_url)
+
+        if not successful_calendars:
+            return [], None, errors
+
+        proof_ctx = BytesSerializationContext()
+        merged_timestamp.serialize(proof_ctx)
+        return successful_calendars, proof_ctx.getbytes(), errors
+
+    async def _submit_tsa_track(
+        self,
+        head_hash_bytes: bytes,
+        tsa_urls: list[str],
+        loop: asyncio.AbstractEventLoop,
+    ) -> tuple[TSAResponse | None, str | None]:
+        """Submit to the first available RFC 3161 TSA in the list.
+
+        Iterates the tsa_urls list and stops at the first success. The
+        rest are fallbacks for the case where the primary TSA is down.
+        Returns (response, None) on success and (None, last_error_repr)
+        when every URL failed. Returns (None, None) when tsa_urls is
+        empty (TSA track disabled).
+        """
+        if not tsa_urls:
+            return None, None
+
+        last_error: str | None = None
+        for tsa_url in tsa_urls:
+            try:
+                response = await loop.run_in_executor(
+                    None,
+                    submit_to_tsa,
+                    head_hash_bytes,
+                    tsa_url,
+                )
+            except TSAError as exc:
+                last_error = repr(exc)
+                continue
+            return response, None
+        return None, last_error
 
     @staticmethod
     def _submit_to_calendar(
@@ -408,28 +510,41 @@ class Ledger:
         *,
         chain_head_hash: str,
         chain_head_entry_id: int,
-        ots_proof_blob: bytes,
+        ots_proof_blob: bytes | None,
         calendar_servers: list[str],
+        tsa_response: TSAResponse | None,
     ) -> AnchorRecord:
         """Persist an anchor row and return the AnchorRecord with its id.
 
-        Caller must already hold self._lock. calendar_servers is stored as
-        a JSON-encoded string in the calendar_servers TEXT column so a URL
-        containing punctuation does not corrupt the round-trip.
+        Caller must already hold self._lock. calendar_servers is stored
+        as JSON in the calendar_servers TEXT column so URL formats
+        round-trip without lossy delimiter handling. The TSA fields are
+        all None when the RFC 3161 track was absent or failed.
         """
         db = self._require_db()
         submitted_at = datetime.now(timezone.utc)
+        tsa_gen_time_iso: str | None = (
+            tsa_response.gen_time.astimezone(timezone.utc).strftime(
+                "%Y-%m-%dT%H:%M:%S.%fZ"
+            )
+            if tsa_response is not None
+            else None
+        )
         cursor = await db.execute(
             "INSERT INTO anchors ("
             "chain_head_hash, chain_head_entry_id, ots_proof_blob, "
-            "submitted_at, calendar_servers"
-            ") VALUES (?, ?, ?, ?, ?)",
+            "submitted_at, calendar_servers, "
+            "tst_blob, tsa_url, tsa_gen_time"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 chain_head_hash,
                 chain_head_entry_id,
                 ots_proof_blob,
                 submitted_at.strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
                 json.dumps(calendar_servers),
+                tsa_response.tst_blob if tsa_response is not None else None,
+                tsa_response.tsa_url if tsa_response is not None else None,
+                tsa_gen_time_iso,
             ),
         )
         anchor_id = cursor.lastrowid
@@ -438,9 +553,12 @@ class Ledger:
             anchor_id=int(anchor_id) if anchor_id is not None else 0,
             chain_head_hash=chain_head_hash,
             chain_head_entry_id=chain_head_entry_id,
-            ots_proof_blob=ots_proof_blob,
             submitted_at=submitted_at,
             calendar_servers=list(calendar_servers),
+            ots_proof_blob=ots_proof_blob,
+            tst_blob=tsa_response.tst_blob if tsa_response is not None else None,
+            tsa_url=tsa_response.tsa_url if tsa_response is not None else None,
+            tsa_gen_time=tsa_response.gen_time if tsa_response is not None else None,
         )
 
     async def close(self) -> None:

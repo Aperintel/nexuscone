@@ -17,6 +17,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
+from nexuscone.rfc3161 import DEFAULT_TSA_URLS
+
 DEFAULT_CALENDAR_SERVERS: list[str] = [
     "https://alice.btc.calendar.opentimestamps.org",
     "https://bob.btc.calendar.opentimestamps.org",
@@ -26,13 +28,24 @@ DEFAULT_CALENDAR_SERVERS: list[str] = [
 
 @dataclass
 class AnchorSchedule:
-    """Controls when Nexuscone submits a chain head to OpenTimestamps.
+    """Controls when Nexuscone submits a chain head to OpenTimestamps and
+    to an RFC 3161 Time-Stamp Authority.
 
     Anchoring fires when EITHER condition is met:
       - new_entries_since_last_anchor >= every_n_entries
       - time_since_last_anchor >= every_m_minutes
 
     Defaults are conservative: 1000 entries or 60 minutes, whichever first.
+
+    Two independent proof tracks per anchor:
+      calendar_servers: OpenTimestamps Bitcoin-anchored proof
+      tsa_urls:         RFC 3161 TSA-signed token (regulator-friendly,
+                        confirmed immediately rather than after a
+                        Bitcoin block)
+
+    Only the first TSA URL in the list is contacted per anchor; the rest
+    are fallbacks for future phases. OpenTimestamps submission is parallel
+    across all configured calendar URLs.
     """
 
     every_n_entries: int = 1000
@@ -40,6 +53,7 @@ class AnchorSchedule:
     calendar_servers: list[str] = field(
         default_factory=lambda: DEFAULT_CALENDAR_SERVERS.copy()
     )
+    tsa_urls: list[str] = field(default_factory=lambda: DEFAULT_TSA_URLS.copy())
     enabled: bool = False
 
 
