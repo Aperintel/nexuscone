@@ -15,7 +15,7 @@ Nexuscone is a small, dependency-light Python library that writes every audit ev
 
 From v0.2.0, the chain head can be anchored periodically to Bitcoin's blockchain through OpenTimestamps, and in parallel to a regulator-friendly RFC 3161 Time-Stamp Authority, so the integrity proof no longer rests on trusting Aperintel or any single party but on Bitcoin's proof-of-work and a signed TSA token. A small set of optional witnesses can also sign the chain head between Bitcoin confirmations to close the confirmation gap.
 
-This is the package extracted from the audit ledger that ships inside Metacarpal (a personal autonomous-agent operating system with twenty-one specialist agents and 150 passing tests) and the Aperintel AI Gateway (a multi-model AI router with a cryptographic audit chain on every request). It is the same chain logic, generalised into a standalone library so anyone building governance-first AI infrastructure can drop it into their stack without rebuilding the cryptographic primitives.
+This is the package extracted from the audit ledger that ships inside Metacarpal (an accountability-first autonomous-agent operating system designed to be auditable to a regulator) and the Aperintel AI Gateway (a multi-model AI router with a cryptographic audit chain on every request). It is the same chain logic, generalised into a standalone library so anyone building governance-first AI infrastructure can drop it into their stack without rebuilding the cryptographic primitives.
 
 ## Install
 
@@ -171,7 +171,11 @@ If you do not need tamper-evidence and a regular log file is fine for your case,
 
 ## Production usage
 
-Nexuscone is the extracted core of the audit chain that runs inside Metacarpal (the personal autonomous-agent operating system this library was extracted from) and the Aperintel AI Gateway (the Aperintel multi-model router). The Aperintel governance product Nexus, which is being built on top of the same primitive, treats Nexuscone as its open-core dependency and adds the dashboards, the BYOK onboarding, the per-customer regional hosting, the FCA and HIPAA evidence packs, and the commercial subscription on top.
+Nexuscone is the extracted core of the audit chain that runs inside Metacarpal (the accountability-first autonomous-agent operating system this library was extracted from, serving both personal and enterprise use on a single auditable spine) and the Aperintel AI Gateway (the Aperintel multi-model router with a 4-provider fallback chain and per-request audit logging). The Aperintel governance product Hyperaxis is built on the same primitive. Hyperaxis treats Nexuscone as its open-core dependency and adds three product surfaces for regulated AI deployments: Discover (AI inventory and risk mapping), Govern (policy enforcement and human-in-the-loop approvals), and Sign (cryptographic accountability and regulator-facing evidence packs for the FCA, EU AI Act Article 12, and NHS DSPT).
+
+## Roadmap
+
+v0.3.x targets AWS-native deployment as a first-class path: a public ECR container image, an AWS Lambda Layer, CloudFormation and Terraform reference modules, optional DynamoDB and Aurora PostgreSQL backends for the ledger, an AWS KMS adapter for signing keys, and a CloudTrail anchor adapter that pulls CloudTrail events into the Nexuscone tamper-evident chain. v0.4.x targets Merkle inclusion proofs and selective disclosure with redaction proofs, so a regulator can verify that a specific event was logged without the auditor seeing the surrounding chain.
 
 ## Local development
 
