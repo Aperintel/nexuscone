@@ -5,7 +5,7 @@ Tamper-evident append-only audit ledger with a SHA-256 hash chain and optional E
 [![PyPI](https://img.shields.io/pypi/v/nexuscone.svg)](https://pypi.org/project/nexuscone/)
 [![Python](https://img.shields.io/pypi/pyversions/nexuscone.svg)](https://pypi.org/project/nexuscone/)
 [![Downloads](https://img.shields.io/pypi/dm/nexuscone.svg)](https://pypi.org/project/nexuscone/)
-[![CI](https://github.com/nexuscone/nexuscone/actions/workflows/ci.yml/badge.svg)](https://github.com/nexuscone/nexuscone/actions/workflows/ci.yml)
+[![CI](https://github.com/aperintel/nexuscone/actions/workflows/ci.yml/badge.svg)](https://github.com/aperintel/nexuscone/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-Apache--2.0-green.svg)](LICENSE)
 [![Typed](https://img.shields.io/badge/typed-mypy%20strict-blue)](https://mypy-lang.org/)
 
@@ -180,7 +180,7 @@ v0.3.x targets AWS-native deployment as a first-class path: a public ECR contain
 ## Local development
 
 ```bash
-git clone https://github.com/nexuscone/nexuscone.git
+git clone https://github.com/aperintel/nexuscone.git
 cd nexuscone
 pip install -e ".[dev]"
 pytest tests/ -v

@@ -31,7 +31,7 @@ Keep PRs focused. One feature or one fix per PR. If you find yourself touching u
 Local development setup:
 
 ```bash
-git clone https://github.com/nexuscone/nexuscone.git
+git clone https://github.com/aperintel/nexuscone.git
 cd nexuscone
 pip install -e ".[dev]"
 pytest tests/ -v
