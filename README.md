@@ -201,4 +201,4 @@ Apache 2.0. See [LICENSE](LICENSE).
 
 ## About
 
-Built by [Aperintel](https://aperintel.com), an AI studio building governance-first AI infrastructure. Nexuscone is the open-core audit primitive underneath the Aperintel governance product family. More at [aperintel.com](https://aperintel.com).
+Built by [Aperintel](https://aperintel.com). Nexuscone is the open-core audit primitive underneath the Aperintel governance product family. More at [aperintel.com](https://aperintel.com).
