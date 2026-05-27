@@ -201,4 +201,4 @@ Apache 2.0. See [LICENSE](LICENSE).
 
 ## About
 
-Built by Julius (Osi) Abu, founder of Aperintel, as the open-core audit primitive underneath the Aperintel governance product family. Aperintel is a self-employed AI studio building governance-first AI infrastructure. Portfolio at [osiabu.vercel.app](https://osiabu.vercel.app), LinkedIn at [linkedin.com/in/osiabu](https://linkedin.com/in/osiabu).
+Built by [Aperintel](https://aperintel.com), an AI studio building governance-first AI infrastructure. Nexuscone is the open-core audit primitive underneath the Aperintel governance product family. More at [aperintel.com](https://aperintel.com).

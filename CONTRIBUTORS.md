@@ -1,6 +1,6 @@
 # Contributors
 
-Nexuscone is maintained by [Julius (Osi) Abu](https://github.com/osiabu) and supported by the people and companies listed below. The audit-ledger primitives shipping under Apache 2.0 are funded directly by these sponsorships.
+Nexuscone is maintained by [Aperintel](https://github.com/aperintel) and supported by the people and companies listed below. The audit-ledger primitives shipping under Apache 2.0 are funded directly by these sponsorships.
 
 ## Sponsors
 

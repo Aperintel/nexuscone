@@ -6,7 +6,7 @@ Nexuscone is a cryptographic audit primitive. A subtle bug in the hash chain, th
 
 Please do not file a public GitHub issue for a security report.
 
-Report security issues by email to **`osi@aperintel.com`** with the subject line `[Nexuscone Security]`. Encrypt sensitive details with the maintainer's public key if you have it; otherwise plaintext is acceptable for an initial contact.
+Report security issues by email to **`enquiries@aperintel.com`** with the subject line `[Nexuscone Security]`. Encrypt sensitive details with the maintainer's public key if you have it; otherwise plaintext is acceptable for an initial contact.
 
 Include in your report:
 

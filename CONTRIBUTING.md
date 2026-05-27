@@ -72,7 +72,7 @@ We do not roll our own crypto. If you propose adding a new primitive, point us a
 
 ## Code of Conduct
 
-This project follows the Contributor Covenant v2.1. Read it in `CODE_OF_CONDUCT.md`. Contact the maintainer at `osi@aperintel.com` for any concerns.
+This project follows the Contributor Covenant v2.1. Read it in `CODE_OF_CONDUCT.md`. Contact the maintainers at `enquiries@aperintel.com` for any concerns.
 
 ## Licence
 
